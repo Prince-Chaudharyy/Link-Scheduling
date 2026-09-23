@@ -1,0 +1,217 @@
+#include <arpa/inet.h>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int connect_to_server(const std::string& ip, int port)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (sock < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr) <= 0) {
+        std::cerr << "Invalid server IP\n";
+        close(sock);
+        return -1;
+    }
+
+    if (connect(sock,
+                reinterpret_cast<sockaddr*>(&server_addr),
+                sizeof(server_addr)) < 0) {
+        perror("connect");
+        close(sock);
+        return -1;
+    }
+
+    return sock;
+}
+
+bool send_all(int sock, const std::string& data)
+{
+    size_t total = 0;
+
+    while (total < data.size()) {
+        ssize_t sent = send(
+            sock,
+            data.data() + total,
+            data.size() - total,
+            0
+        );
+
+        if (sent <= 0) {
+            return false;
+        }
+
+        total += static_cast<size_t>(sent);
+    }
+
+    return true;
+}
+
+std::string receive_response(int sock)
+{
+    char buffer[4096];
+    std::string response;
+
+    while (true) {
+        ssize_t received = recv(sock, buffer, sizeof(buffer), 0);
+
+        if (received <= 0) {
+            break;
+        }
+
+        response.append(buffer, static_cast<size_t>(received));
+
+        if (response.find('\n') != std::string::npos) {
+            break;
+        }
+    }
+
+    return response;
+}
+
+int health()
+{
+    int sock = connect_to_server("127.0.0.1", 9000);
+
+    if (sock < 0) {
+        return 1;
+    }
+
+    if (!send_all(sock, "HEALTH\n")) {
+        std::cerr << "Failed to send HEALTH request\n";
+        close(sock);
+        return 1;
+    }
+
+    std::string response = receive_response(sock);
+
+    std::cout << response;
+
+    close(sock);
+    return 0;
+}
+
+int get_file(const std::string& filename)
+{
+    int sock = connect_to_server("127.0.0.1", 9000);
+
+    if (sock < 0) {
+        return 1;
+    }
+
+    std::string request = "GET " + filename + "\n";
+
+    if (!send_all(sock, request)) {
+        std::cerr << "Failed to send GET request\n";
+        close(sock);
+        return 1;
+    }
+
+    std::string response = receive_response(sock);
+
+    std::cout << response;
+
+    close(sock);
+    return 0;
+}
+
+int put_file(const std::string& filename)
+{
+    std::ifstream file(filename, std::ios::binary);
+
+    if (!file) {
+        std::cerr << "Cannot open file: " << filename << "\n";
+        return 1;
+    }
+
+    file.seekg(0, std::ios::end);
+    std::streamsize file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::string data(static_cast<size_t>(file_size), '\0');
+
+    if (file_size > 0) {
+        file.read(data.data(), file_size);
+    }
+
+    file.close();
+
+    int sock = connect_to_server("127.0.0.1", 9000);
+
+    if (sock < 0) {
+        return 1;
+    }
+
+    std::string header =
+        "PUT " + filename + " " +
+        std::to_string(data.size()) + "\n";
+
+    if (!send_all(sock, header)) {
+        std::cerr << "Failed to send PUT header\n";
+        close(sock);
+        return 1;
+    }
+
+    if (!data.empty() && !send_all(sock, data)) {
+        std::cerr << "Failed to send file data\n";
+        close(sock);
+        return 1;
+    }
+
+    std::string response = receive_response(sock);
+
+    std::cout << response;
+
+    close(sock);
+    return 0;
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc < 2) {
+        std::cerr << "Usage:\n";
+        std::cerr << "  ./client health\n";
+        std::cerr << "  ./client get <filename>\n";
+        std::cerr << "  ./client put <filename>\n";
+        return 1;
+    }
+
+    std::string command = argv[1];
+
+    if (command == "health") {
+        return health();
+    }
+
+    if (command == "get") {
+        if (argc != 3) {
+            std::cerr << "Usage: ./client get <filename>\n";
+            return 1;
+        }
+
+        return get_file(argv[2]);
+    }
+
+    if (command == "put") {
+        if (argc != 3) {
+            std::cerr << "Usage: ./client put <filename>\n";
+            return 1;
+        }
+
+        return put_file(argv[2]);
+    }
+
+    std::cerr << "Unknown command: " << command << "\n";
+    return 1;
+}

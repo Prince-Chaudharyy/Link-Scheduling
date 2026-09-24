@@ -213,11 +213,30 @@ int put_file(const std::string& filename)
         "PUT " + filename + " " +
         std::to_string(data.size()) + "\n";
 
+    /*
+     * PUT protocol:
+     * 1. Send the header.
+     * 2. Wait for the server's initial OK 0.
+     * 3. Send the file body.
+     * 4. Wait for the final OK 0.
+     */
+
     if (!send_all(sock, header)) {
         std::cerr << "Failed to send PUT header\n";
         close(sock);
         return 1;
     }
+
+    std::string initial_response = receive_response(sock);
+
+    if (initial_response.rfind("OK ", 0) != 0) {
+        std::cerr << "PUT rejected: "
+                  << initial_response;
+        close(sock);
+        return 1;
+    }
+
+    std::cout << initial_response;
 
     if (!data.empty() && !send_all(sock, data)) {
         std::cerr << "Failed to send file data\n";
@@ -225,9 +244,15 @@ int put_file(const std::string& filename)
         return 1;
     }
 
-    std::string response = receive_response(sock);
+    std::string final_response = receive_response(sock);
 
-    std::cout << response;
+    std::cout << final_response;
+
+    if (final_response != "OK 0\n") {
+        std::cerr << "PUT did not complete successfully\n";
+        close(sock);
+        return 1;
+    }
 
     close(sock);
     return 0;

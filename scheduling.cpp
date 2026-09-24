@@ -38,20 +38,14 @@ ScheduleDecision Scheduler::next(RequestQueue& queue)
                     request,
                     [](const Request& a, const Request& b) {
 
-                        const std::uint64_t remaining_a =
-                            (a.total_bytes > a.offset)
-                                ? (a.total_bytes - a.offset)
-                                : 0;
-
-                        const std::uint64_t remaining_b =
-                            (b.total_bytes > b.offset)
-                                ? (b.total_bytes - b.offset)
-                                : 0;
-
-                        if (remaining_a != remaining_b) {
-                            return remaining_a < remaining_b;
+                        // SJF uses the declared request size:
+                        // GET  -> file size known before admission
+                        // PUT  -> byte count declared in the request
+                        if (a.total_bytes != b.total_bytes) {
+                            return a.total_bytes < b.total_bytes;
                         }
 
+                        // Deterministic tie-break: earlier arrival first.
                         return a.arrival_ns < b.arrival_ns;
                     })) {
 
@@ -134,15 +128,18 @@ void Scheduler::account(
     Request& request,
     std::uint64_t bytes_processed)
 {
-    if (bytes_processed == 0) {
-        return;
-    }
+    // Every scheduler selection is one scheduled round.
+    // This includes a DRR round that transfers zero bytes because
+    // the next complete GET line does not yet fit the deficit.
+    request.rounds++;
 
+    const std::uint64_t remaining =
+        (request.total_bytes > request.offset)
+            ? (request.total_bytes - request.offset)
+            : 0;
 
-    const std::uint64_t remaining = (request.total_bytes > request.offset) ? (request.total_bytes - request.offset) : 0;
-
-
-    const std::uint64_t actual = std::min(bytes_processed, remaining);
+    const std::uint64_t actual =
+        std::min(bytes_processed, remaining);
 
     request.offset += actual;
 
@@ -155,10 +152,7 @@ void Scheduler::account(
             request.deficit -= actual;
         }
     }
-
-    request.rounds++;
 }
-
 
 bool Scheduler::should_requeue(
     const Request& request) const

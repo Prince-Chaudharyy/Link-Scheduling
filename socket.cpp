@@ -1,3 +1,4 @@
+#include <chrono>
 #include "socket.h"
 #include <iostream>
 #include <sys/socket.h>
@@ -94,28 +95,51 @@ ssize_t recv_data_with_timeout(int socket_fd, void* buffer, size_t size, int tim
 std::string read_header_line(int socket_fd, int timeout_ms) {
     std::string line;
     char buffer[1];
-    
-    // Read byte by byte until we get a newline or timeout
-    while (line.size() < 1024) {  // Max 1024 bytes for header
-        ssize_t n = recv_data_with_timeout(socket_fd, buffer, 1, timeout_ms);
-        
-        if (n < 0) {
-            // Error
-            return "";
-        } else if (n == 0) {
-            // Timeout or connection closed
+
+    // A5: use one overall deadline for the complete header read.
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+
+    while (line.size() < 1024) {
+        const auto now = std::chrono::steady_clock::now();
+
+        if (now >= deadline) {
             return "";
         }
-        
+
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now
+            ).count();
+
+        const int remaining_ms =
+            static_cast<int>(remaining > 0 ? remaining : 1);
+
+        ssize_t n =
+            recv_data_with_timeout(
+                socket_fd,
+                buffer,
+                1,
+                remaining_ms
+            );
+
+        if (n < 0) {
+            return "";
+        }
+
+        if (n == 0) {
+            return "";
+        }
+
         line += buffer[0];
-        
-        // Check if we got a newline
+
         if (buffer[0] == '\n') {
             return line;
         }
     }
-    
-    // Header too long
+
+    // Header too long.
     return "";
 }
 

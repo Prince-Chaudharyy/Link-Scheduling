@@ -131,17 +131,6 @@ void acceptor_thread(
 
             req.request_id = ++request_id;
 
-            // CLOCK_MONOTONIC equivalent using steady_clock.
-            req.arrival_ns =
-                static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<
-                        std::chrono::nanoseconds
-                    >(
-                        std::chrono::steady_clock::now()
-                            .time_since_epoch()
-                    ).count()
-                );
-
             std::cout
                 << "Request "
                 << req.request_id
@@ -157,7 +146,7 @@ void acceptor_thread(
             // ------------------------------------------------
             if (req.op == Operation::HEALTH) {
 
-                send_response(client_socket, 0);
+                send_response(client_socket, request_queue.size());
 
                 std::cout
                     << "  HEALTH check"
@@ -234,6 +223,19 @@ void acceptor_thread(
             // ------------------------------------------------
             // Queue the request
             // ------------------------------------------------
+
+            // A18: arrival is recorded after the request has been
+            // fully parsed and is ready to be admitted to the queue.
+            req.arrival_ns =
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds
+                    >(
+                        std::chrono::steady_clock::now()
+                            .time_since_epoch()
+                    ).count()
+                );
+
             if (!request_queue.push(req)) {
 
                 send_error(
@@ -286,7 +288,8 @@ void worker_thread(
     RequestQueue& request_queue,
     Scheduler& scheduler,
     std::mutex& scheduler_mutex,
-    const std::string& metrics_out)
+    const std::string& metrics_out,
+    int packetization)
 {
     // Scheduler operations are safe here because RequestQueue
     // provides its own synchronization and Scheduler only updates
@@ -303,15 +306,19 @@ void worker_thread(
 
         Request req = std::move(decision.request);
 
-        req.start_ns =
-            static_cast<std::uint64_t>(
-                std::chrono::duration_cast<
-                    std::chrono::nanoseconds
-                >(
-                    std::chrono::steady_clock::now()
-                        .time_since_epoch()
-                ).count()
-            );
+        // Record start time only when the worker first picks up
+        // this request. RR/DRR rounds must not overwrite it.
+        if (req.start_ns == 0) {
+            req.start_ns =
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds
+                    >(
+                        std::chrono::steady_clock::now()
+                            .time_since_epoch()
+                    ).count()
+                );
+        }
 
         std::cout
             << "Worker "
@@ -334,11 +341,21 @@ void worker_thread(
                 req,
                 file_dir,
                 decision.budget,
-                bytes_processed
+                bytes_processed,
+                scheduler.policy() == SchedulingPolicy::RR,
+                packetization
             );
 
         }
         else if (req.op == Operation::PUT) {
+
+            // PUT protocol:
+            // 1. Server acknowledges before receiving the body.
+            // 2. Body is then received according to the scheduler.
+            // 3. Final OK 0 is sent after all bytes arrive.
+            if (req.offset == 0) {
+                send_response(req.client_fd, 0);
+            }
 
             success = serve_put(
                 req,
@@ -353,11 +370,25 @@ void worker_thread(
             continue;
         }
 
-        // Update the scheduler with the actual bytes processed.
+        // Update the scheduler with the actual bytes processed first.
+        // This advances the request offset before deciding whether
+        // anything remains to be scheduled.
         scheduler.account(req, bytes_processed);
 
         // Check whether the request still has data remaining.
         bool requeue = scheduler.should_requeue(req);
+
+        // RR forfeits unused allowance when a GET is preempted and
+        // requeued. DRR retains unused allowance as deficit.
+        // PUT requests always have zero forfeited bytes.
+        if (requeue &&
+            scheduler.policy() == SchedulingPolicy::RR &&
+            req.op == Operation::GET &&
+            bytes_processed < decision.budget) {
+
+            req.forfeited_bytes +=
+                decision.budget - bytes_processed;
+        }
 
         if (requeue) {
 
@@ -393,12 +424,9 @@ void worker_thread(
                 ).count()
             );
 
-        // PUT sends its final response only after all bytes arrive.
+        // PUT sends the final OK 0 only after all bytes arrive.
         if (req.op == Operation::PUT) {
-            send_response(
-                req.client_fd,
-                req.total_bytes
-            );
+            send_response(req.client_fd, 0);
         }
 
         std::cout
@@ -702,7 +730,8 @@ int main(int argc, char* argv[])
             std::ref(request_queue),
             std::ref(scheduler),
             std::ref(scheduler_mutex),
-            std::cref(metrics_out)
+            std::cref(metrics_out),
+            packetization
         );
     }
 

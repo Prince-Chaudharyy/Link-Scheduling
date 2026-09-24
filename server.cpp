@@ -14,7 +14,9 @@ bool serve_get(
     Request& req,
     const std::string& file_dir,
     std::uint64_t budget,
-    std::uint64_t& bytes_processed)
+    std::uint64_t& bytes_processed,
+    bool allow_long_line_overrun,
+    int packetization)
 {
     bytes_processed = 0;
 
@@ -48,15 +50,92 @@ bool serve_get(
             << std::endl;
     }
 
-    // Nothing left to send.
     if (req.offset >= file_size || budget == 0) {
         return true;
     }
 
-    const std::uint64_t remaining = file_size - req.offset;
-    const std::uint64_t to_send =
-        std::min(budget, remaining);
+    if (packetization <= 0) {
+        send_error(req.client_fd, "invalid packetization");
+        return false;
+    }
 
+    const std::uint64_t remaining = file_size - req.offset;
+
+    /*
+     * FCFS/SJF give the complete remaining request as their budget.
+     * RR/DRR use line-based scheduling.
+     */
+    const bool complete_request_round = (budget >= remaining);
+
+    std::uint64_t round_bytes = 0;
+
+    if (complete_request_round) {
+        /*
+         * The entire remaining request fits in this scheduling round.
+         */
+        round_bytes = remaining;
+    } else {
+        /*
+         * RR and DRR:
+         * Select only complete lines that fit inside the allowance.
+         */
+        std::size_t line_offset =
+            static_cast<std::size_t>(req.offset);
+
+        while (round_bytes < budget) {
+            std::string line =
+                read_file_line(filepath, line_offset);
+
+            if (line.empty()) {
+                break;
+            }
+
+            const std::uint64_t line_size =
+                static_cast<std::uint64_t>(line.size());
+
+            /*
+             * A14:
+             * RR may send one line larger than Q.
+             * DRR must wait until its deficit covers the line.
+             */
+            if (round_bytes == 0 && line_size > budget) {
+                if (allow_long_line_overrun) {
+                    round_bytes = line_size;
+                }
+
+                break;
+            }
+
+            /*
+             * Never split a GET line between scheduling rounds.
+             */
+            if (round_bytes + line_size > budget) {
+                break;
+            }
+
+            round_bytes += line_size;
+        }
+    }
+
+    /*
+     * DRR may need several rounds before a long line fits.
+     */
+    if (round_bytes == 0) {
+        std::cout
+            << "  No complete line fits this round"
+            << " (offset "
+            << req.offset
+            << "/"
+            << file_size
+            << ")"
+            << std::endl;
+
+        return true;
+    }
+
+    /*
+     * Re-open and seek to the exact byte offset.
+     */
     std::ifstream file(filepath, std::ios::binary);
 
     if (!file.is_open()) {
@@ -75,39 +154,60 @@ bool serve_get(
         return false;
     }
 
-    const std::size_t CHUNK_SIZE = 8192;
-    std::vector<char> buffer(
-        std::min<std::uint64_t>(CHUNK_SIZE, to_send)
-    );
+    /*
+     * A8:
+     * Gather up to `packetization` complete lines into one write.
+     *
+     * Packetization changes only the grouping of writes. It does not
+     * change the selected bytes, their order, or scheduling accounting.
+     */
+    std::size_t line_offset =
+        static_cast<std::size_t>(req.offset);
 
-    std::uint64_t remaining_round = to_send;
+    std::uint64_t remaining_round = round_bytes;
 
     while (remaining_round > 0) {
-        const std::size_t chunk =
-            static_cast<std::size_t>(
-                std::min<std::uint64_t>(
-                    buffer.size(),
-                    remaining_round
-                )
-            );
+        std::string packet;
+        std::size_t lines_in_packet = 0;
 
-        file.read(
-            buffer.data(),
-            static_cast<std::streamsize>(chunk)
-        );
+        while (lines_in_packet <
+                   static_cast<std::size_t>(packetization) &&
+               remaining_round > 0) {
 
-        const std::streamsize bytes_read = file.gcount();
+            std::string line =
+                read_file_line(filepath, line_offset);
 
-        if (bytes_read <= 0) {
-            file.close();
-            send_error(req.client_fd, "file read error");
-            return false;
+            if (line.empty()) {
+                file.close();
+                send_error(req.client_fd, "file read error");
+                return false;
+            }
+
+            const std::uint64_t line_size =
+                static_cast<std::uint64_t>(line.size());
+
+            /*
+             * Do not allow this packet to exceed the selected
+             * scheduling round.
+             */
+            if (line_size > remaining_round) {
+                file.close();
+                send_error(req.client_fd, "packetization error");
+                return false;
+            }
+
+            packet.append(line);
+            remaining_round -= line_size;
+            ++lines_in_packet;
         }
 
+        /*
+         * One send_all() call represents one packetization group.
+         */
         if (!send_all(
                 req.client_fd,
-                buffer.data(),
-                static_cast<std::size_t>(bytes_read))) {
+                packet.data(),
+                packet.size())) {
 
             file.close();
             std::cerr << "Error sending file" << std::endl;
@@ -115,28 +215,19 @@ bool serve_get(
         }
 
         bytes_processed +=
-            static_cast<std::uint64_t>(bytes_read);
-
-        remaining_round -=
-            static_cast<std::uint64_t>(bytes_read);
+            static_cast<std::uint64_t>(packet.size());
     }
 
     file.close();
 
     std::cout
-        << "  Sent "
-        << bytes_processed
-        << " bytes this round"
-        << " (offset "
-        << req.offset + bytes_processed
-        << "/"
-        << file_size
-        << ")"
+        << "  Sent " << bytes_processed << " bytes this round"
+        << " (offset " << req.offset + bytes_processed
+        << "/" << file_size << ")"
         << std::endl;
 
     return true;
 }
-
 
 bool serve_put(
     Request& req,

@@ -19,7 +19,18 @@ static const char* operation_to_string(Operation op)
     return "UNKNOWN";
 }
 
-bool write_metrics_header(const std::string& filename)
+void record_completed_request(
+    std::vector<Request>& completed_requests,
+    std::mutex& metrics_mutex,
+    const Request& request)
+{
+    std::lock_guard<std::mutex> lock(metrics_mutex);
+    completed_requests.push_back(request);
+}
+
+bool write_metrics(
+    const std::string& filename,
+    const std::vector<Request>& requests)
 {
     std::ofstream file(filename);
 
@@ -30,30 +41,23 @@ bool write_metrics_header(const std::string& filename)
     file << "request_id,op,filename,bytes,rounds,forfeited_bytes,"
             "arrival_ns,start_ns,finish_ns\n";
 
-    return file.good();
-}
+    for (const Request& request : requests) {
+        // HEALTH requests are not included in the metrics CSV.
+        if (request.op == Operation::HEALTH) {
+            continue;
+        }
 
-bool append_metric(
-    const std::string& filename,
-    const Request& request)
-{
-    std::ofstream file(filename, std::ios::app);
-
-    if (!file.is_open()) {
-        return false;
+        file << request.request_id << ","
+             << operation_to_string(request.op) << ","
+             << "\"" << request.filename << "\"" << ","
+             << request.total_bytes << ","
+             << request.rounds << ","
+             << request.forfeited_bytes << ","
+             << request.arrival_ns << ","
+             << request.start_ns << ","
+             << request.finish_ns
+             << "\n";
     }
 
-    file << request.request_id << ","
-         << operation_to_string(request.op) << ","
-         << "\"" << request.filename << "\"" << ","
-         << request.total_bytes << ","
-         << request.rounds << ","
-         << request.forfeited_bytes << ","
-         << request.arrival_ns << ","
-         << request.start_ns << ","
-         << request.finish_ns
-         << "\n";
-
     return file.good();
 }
-

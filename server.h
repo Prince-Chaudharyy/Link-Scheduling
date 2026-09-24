@@ -1,11 +1,21 @@
 #pragma once
 
 #include "request.h"
+#include <cstdint>
 #include <string>
 
-// Serve GET request - send file to client
-void serve_get(const Request& req, const std::string& file_dir);
+// Process up to budget bytes of a GET request.
+bool serve_get(
+    Request& req,
+    const std::string& file_dir,
+    std::uint64_t budget,
+    std::uint64_t& bytes_processed
+);
 
-// Serve PUT request - receive file from client
-void serve_put(const Request& req, const std::string& file_dir);
-
+// Process up to budget bytes of a PUT request.
+bool serve_put(
+    Request& req,
+    const std::string& file_dir,
+    std::uint64_t budget,
+    std::uint64_t& bytes_processed
+);

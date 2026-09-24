@@ -1,127 +1,253 @@
 #include "server.h"
+
 #include "file_io.h"
 #include "protocol.h"
 #include "socket.h"
-#include <iostream>
-#include <fstream>
-#include <sys/socket.h>
 
-void serve_get(const Request& req, const std::string& file_dir) {
-    // Build full file path
-    std::string filepath = file_dir + "/" + req.filename;
-    
-    // Check if file exists
+#include <algorithm>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <vector>
+
+bool serve_get(
+    Request& req,
+    const std::string& file_dir,
+    std::uint64_t budget,
+    std::uint64_t& bytes_processed)
+{
+    bytes_processed = 0;
+
+    if (!is_valid_filename(req.filename)) {
+        send_error(req.client_fd, "invalid filename");
+        return false;
+    }
+
+    const std::string filepath = file_dir + "/" + req.filename;
+
     if (!file_exists(filepath)) {
         std::cerr << "File not found: " << filepath << std::endl;
-        send_error(req.socket_fd, "file not found");
-        return;
+        send_error(req.client_fd, "file not found");
+        return false;
     }
-    
-    // Get file size
-    size_t file_size = get_file_size(filepath);
-    
-    // Send OK response with file size
-    std::cout << "  Sending " << file_size << " bytes from " << req.filename << std::endl;
-    send_response(req.socket_fd, file_size);
-    
-    // Now send the actual file content
+
+    const std::uint64_t file_size =
+        static_cast<std::uint64_t>(get_file_size(filepath));
+
+    req.total_bytes = file_size;
+
+    // Send the GET response header only once.
+    if (!req.response_sent) {
+        send_response(req.client_fd, file_size);
+        req.response_sent = true;
+
+        std::cout
+            << "  GET response: "
+            << file_size
+            << " bytes"
+            << std::endl;
+    }
+
+    // Nothing left to send.
+    if (req.offset >= file_size || budget == 0) {
+        return true;
+    }
+
+    const std::uint64_t remaining = file_size - req.offset;
+    const std::uint64_t to_send =
+        std::min(budget, remaining);
+
     std::ifstream file(filepath, std::ios::binary);
+
     if (!file.is_open()) {
-        std::cerr << "Cannot open file: " << filepath << std::endl;
-        return;
+        send_error(req.client_fd, "cannot open file");
+        return false;
     }
-    
-    // Read and send file in chunks
-    const size_t CHUNK_SIZE = 8192;  // 8KB chunks
-    char buffer[CHUNK_SIZE];
-    
-    while (file.good()) {
-        file.read(buffer, CHUNK_SIZE);
-        size_t bytes_read = file.gcount();
-        
-        if (bytes_read > 0) {
-            if (!send_all(req.socket_fd, buffer, bytes_read)) {
-                std::cerr << "Error sending file" << std::endl;
-                file.close();
-                return;
-            }
+
+    file.seekg(
+        static_cast<std::streamoff>(req.offset),
+        std::ios::beg
+    );
+
+    if (!file.good()) {
+        file.close();
+        send_error(req.client_fd, "file seek error");
+        return false;
+    }
+
+    const std::size_t CHUNK_SIZE = 8192;
+    std::vector<char> buffer(
+        std::min<std::uint64_t>(CHUNK_SIZE, to_send)
+    );
+
+    std::uint64_t remaining_round = to_send;
+
+    while (remaining_round > 0) {
+        const std::size_t chunk =
+            static_cast<std::size_t>(
+                std::min<std::uint64_t>(
+                    buffer.size(),
+                    remaining_round
+                )
+            );
+
+        file.read(
+            buffer.data(),
+            static_cast<std::streamsize>(chunk)
+        );
+
+        const std::streamsize bytes_read = file.gcount();
+
+        if (bytes_read <= 0) {
+            file.close();
+            send_error(req.client_fd, "file read error");
+            return false;
         }
+
+        if (!send_all(
+                req.client_fd,
+                buffer.data(),
+                static_cast<std::size_t>(bytes_read))) {
+
+            file.close();
+            std::cerr << "Error sending file" << std::endl;
+            return false;
+        }
+
+        bytes_processed +=
+            static_cast<std::uint64_t>(bytes_read);
+
+        remaining_round -=
+            static_cast<std::uint64_t>(bytes_read);
     }
-    
+
     file.close();
-    std::cout << "  File transmission complete" << std::endl;
+
+    std::cout
+        << "  Sent "
+        << bytes_processed
+        << " bytes this round"
+        << " (offset "
+        << req.offset + bytes_processed
+        << "/"
+        << file_size
+        << ")"
+        << std::endl;
+
+    return true;
 }
 
-void serve_put(const Request& req, const std::string& file_dir) {
-    // Validate filename before constructing the path.
+
+bool serve_put(
+    Request& req,
+    const std::string& file_dir,
+    std::uint64_t budget,
+    std::uint64_t& bytes_processed)
+{
+    bytes_processed = 0;
+
     if (!is_valid_filename(req.filename)) {
-        send_error(req.socket_fd, "invalid filename");
-        return;
+        send_error(req.client_fd, "invalid filename");
+        return false;
     }
 
-    // Build the destination path inside the configured file directory.
-    std::string filepath = file_dir + "/" + req.filename;
+    const std::string filepath = file_dir + "/" + req.filename;
 
-    std::cout << "  PUT request: "
-              << req.bytes_to_transfer
-              << " bytes incoming"
-              << std::endl;
+    std::cout
+        << "  PUT request: "
+        << req.total_bytes
+        << " bytes incoming"
+        << std::endl;
 
-    std::cout << "  Saving to: "
-              << filepath
-              << std::endl;
+    std::cout
+        << "  Saving to: "
+        << filepath
+        << std::endl;
 
-    // Open with truncation so PUT replaces an existing file.
-    std::ofstream file(
+    // A zero-byte PUT is valid.
+    if (req.total_bytes == 0) {
+        return true;
+    }
+
+    if (req.offset == 0) {
+        // First round: create/truncate the destination.
+        std::ofstream create_file(
+            filepath,
+            std::ios::binary | std::ios::trunc
+        );
+
+        if (!create_file.is_open()) {
+            send_error(req.client_fd, "cannot create file");
+            return false;
+        }
+
+        create_file.close();
+    }
+
+    std::fstream file(
         filepath,
-        std::ios::binary | std::ios::trunc
+        std::ios::binary |
+        std::ios::in |
+        std::ios::out
     );
 
     if (!file.is_open()) {
-        std::cerr << "Cannot create file: "
-                  << filepath
-                  << std::endl;
-
-        send_error(req.socket_fd, "cannot create file");
-        return;
+        send_error(req.client_fd, "cannot open file");
+        return false;
     }
 
-    const size_t CHUNK_SIZE = 8192;
-    std::vector<char> buffer(CHUNK_SIZE);
+    file.seekp(
+        static_cast<std::streamoff>(req.offset),
+        std::ios::beg
+    );
 
-    size_t total_received = 0;
+    if (!file.good()) {
+        file.close();
+        send_error(req.client_fd, "file seek error");
+        return false;
+    }
 
-    while (total_received < req.bytes_to_transfer) {
-        size_t remaining =
-            req.bytes_to_transfer - total_received;
+    const std::uint64_t remaining =
+        req.total_bytes - req.offset;
 
-        size_t to_receive =
-            std::min(CHUNK_SIZE, remaining);
+    const std::uint64_t to_receive =
+        std::min(budget, remaining);
 
-        ssize_t received = recv_data_with_timeout(
-            req.socket_fd,
-            buffer.data(),
-            to_receive,
-            5000
-        );
+    const std::size_t CHUNK_SIZE = 8192;
+
+    std::vector<char> buffer(
+        std::min<std::uint64_t>(CHUNK_SIZE, to_receive)
+    );
+
+    std::uint64_t remaining_round = to_receive;
+
+    while (remaining_round > 0) {
+        const std::size_t chunk =
+            static_cast<std::size_t>(
+                std::min<std::uint64_t>(
+                    buffer.size(),
+                    remaining_round
+                )
+            );
+
+        const ssize_t received =
+            recv_data_with_timeout(
+                req.client_fd,
+                buffer.data(),
+                chunk,
+                5000
+            );
 
         if (received < 0) {
-            std::cerr << "Error receiving PUT data"
-                      << std::endl;
-
             file.close();
-            send_error(req.socket_fd, "receive error");
-            return;
+            send_error(req.client_fd, "receive error");
+            return false;
         }
 
         if (received == 0) {
-            std::cerr << "Client closed connection before "
-                      << "all PUT data was received"
-                      << std::endl;
-
             file.close();
-            send_error(req.socket_fd, "incomplete upload");
-            return;
+            send_error(req.client_fd, "incomplete upload");
+            return false;
         }
 
         file.write(
@@ -130,29 +256,30 @@ void serve_put(const Request& req, const std::string& file_dir) {
         );
 
         if (!file.good()) {
-            std::cerr << "Error writing file: "
-                      << filepath
-                      << std::endl;
-
             file.close();
-            send_error(req.socket_fd, "file write error");
-            return;
+            send_error(req.client_fd, "file write error");
+            return false;
         }
 
-        total_received += static_cast<size_t>(received);
+        bytes_processed +=
+            static_cast<std::uint64_t>(received);
+
+        remaining_round -=
+            static_cast<std::uint64_t>(received);
     }
 
     file.close();
 
-    std::cout << "  PUT complete: "
-              << total_received
-              << " bytes received"
-              << std::endl;
+    std::cout
+        << "  Received "
+        << bytes_processed
+        << " bytes this round"
+        << " (offset "
+        << req.offset + bytes_processed
+        << "/"
+        << req.total_bytes
+        << ")"
+        << std::endl;
 
-    send_response(
-        req.socket_fd,
-        static_cast<int>(total_received)
-    );
+    return true;
 }
-
-

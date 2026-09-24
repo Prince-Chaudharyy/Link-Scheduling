@@ -26,7 +26,7 @@ ScheduleDecision Scheduler::next(RequestQueue& queue)
 
         case SchedulingPolicy::FCFS:
 
-            if (!queue.try_pop(request)) {
+            if (!queue.wait_pop(request)) {
                 return decision;
             }
 
@@ -62,7 +62,7 @@ ScheduleDecision Scheduler::next(RequestQueue& queue)
 
         case SchedulingPolicy::RR:
 
-            if (!queue.try_pop(request)) {
+            if (!queue.wait_pop(request)) {
                 return decision;
             }
 
@@ -70,7 +70,7 @@ ScheduleDecision Scheduler::next(RequestQueue& queue)
 
         case SchedulingPolicy::DRR:
 
-            if (!queue.try_pop(request)) {
+            if (!queue.wait_pop(request)) {
                 return decision;
             }
 

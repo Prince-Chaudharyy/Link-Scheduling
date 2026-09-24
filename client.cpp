@@ -119,9 +119,64 @@ int get_file(const std::string& filename)
         return 1;
     }
 
+    // Receive the response header: OK <size>\n or ERR <reason>\n
     std::string response = receive_response(sock);
-
     std::cout << response;
+
+    if (response.rfind("OK ", 0) != 0) {
+        close(sock);
+        return 1;
+    }
+
+    // Extract file size from "OK <size>\n"
+    std::uint64_t file_size = 0;
+
+    try {
+        std::string size_text = response.substr(3);
+        file_size = std::stoull(size_text);
+    }
+    catch (...) {
+        std::cerr << "Invalid GET response\n";
+        close(sock);
+        return 1;
+    }
+
+    // Receive the actual file contents.
+    std::uint64_t received = 0;
+    char buffer[8192];
+
+    while (received < file_size) {
+
+        std::uint64_t remaining = file_size - received;
+        std::size_t to_receive =
+            static_cast<std::size_t>(
+                std::min<std::uint64_t>(
+                    remaining,
+                    sizeof(buffer)
+                )
+            );
+
+        ssize_t n = recv(
+            sock,
+            buffer,
+            to_receive,
+            0
+        );
+
+        if (n <= 0) {
+            std::cerr << "\nConnection closed before "
+                      << "the complete file was received\n";
+            close(sock);
+            return 1;
+        }
+
+        std::cout.write(buffer, n);
+        received += static_cast<std::uint64_t>(n);
+    }
+
+    std::cout << "\nReceived "
+              << received
+              << " bytes\n";
 
     close(sock);
     return 0;

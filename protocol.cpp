@@ -1,15 +1,19 @@
 #include "protocol.h"
-#include <sstream>
-#include <iostream>
+
 #include <algorithm>
-#include <sys/socket.h>
+#include <cctype>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+
 #include "socket.h"
 
-Request parse_request_header(const std::string& header_line, int socket_fd)
+Request parse_request_header(const std::string& header_line, int client_fd)
 {
     std::string line = header_line;
 
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+    while (!line.empty() &&
+           (line.back() == '\n' || line.back() == '\r')) {
         line.pop_back();
     }
 
@@ -31,7 +35,7 @@ Request parse_request_header(const std::string& header_line, int socket_fd)
     }
 
     Request request;
-    request.socket_fd = socket_fd;
+    request.client_fd = client_fd;
 
     if (op == "HEALTH") {
         std::string extra;
@@ -40,9 +44,9 @@ Request parse_request_header(const std::string& header_line, int socket_fd)
             throw std::runtime_error("HEALTH takes no arguments");
         }
 
-        request.op = "HEALTH";
-        request.filename = "";
-        request.bytes_to_transfer = 0;
+        request.op = Operation::HEALTH;
+        request.filename.clear();
+        request.total_bytes = 0;
 
         return request;
     }
@@ -56,12 +60,14 @@ Request parse_request_header(const std::string& header_line, int socket_fd)
         }
 
         if (iss >> extra) {
-            throw std::runtime_error("GET takes exactly one filename");
+            throw std::runtime_error(
+                "GET takes exactly one filename"
+            );
         }
 
-        request.op = "GET";
+        request.op = Operation::GET;
         request.filename = filename;
-        request.bytes_to_transfer = 0;
+        request.total_bytes = 0;
 
         return request;
     }
@@ -76,7 +82,9 @@ Request parse_request_header(const std::string& header_line, int socket_fd)
         }
 
         if (!(iss >> byte_string)) {
-            throw std::runtime_error("PUT requires byte count");
+            throw std::runtime_error(
+                "PUT requires byte count"
+            );
         }
 
         if (iss >> extra) {
@@ -85,44 +93,64 @@ Request parse_request_header(const std::string& header_line, int socket_fd)
             );
         }
 
-        size_t bytes = 0;
+        if (byte_string.empty() ||
+            !std::all_of(
+                byte_string.begin(),
+                byte_string.end(),
+                [](unsigned char c) {
+                    return std::isdigit(c);
+                })) {
+            throw std::runtime_error(
+                "invalid byte count"
+            );
+        }
+
+        std::uint64_t bytes = 0;
 
         try {
-            size_t consumed = 0;
-
-            unsigned long long value =
-                std::stoull(byte_string, &consumed);
-
-            if (consumed != byte_string.size()) {
-                throw std::runtime_error("invalid byte count");
-            }
-
-            bytes = static_cast<size_t>(value);
+            bytes = std::stoull(byte_string);
         }
-        catch (...) {
-            throw std::runtime_error("invalid byte count");
+        catch (const std::exception&) {
+            throw std::runtime_error(
+                "invalid byte count"
+            );
         }
 
-        request.op = "PUT";
+        request.op = Operation::PUT;
         request.filename = filename;
-        request.bytes_to_transfer = bytes;
+        request.total_bytes = bytes;
 
         return request;
     }
 
-    throw std::runtime_error("unknown operation: " + op);
+    throw std::runtime_error(
+        "unknown operation: " + op
+    );
 }
 
-void send_response(int socket_fd, int value)
+void send_response(int client_fd, std::uint64_t value)
 {
-    std::string response = "OK " + std::to_string(value) + "\n";
-    send_all(socket_fd, response.c_str(), response.size());
+    std::string response =
+        "OK " + std::to_string(value) + "\n";
+
+    if (!send_all(
+            client_fd,
+            response.data(),
+            response.size())) {
+        std::cerr << "Failed to send response" << std::endl;
+    }
 }
 
-void send_error(int socket_fd, const std::string& reason)
+void send_error(int client_fd, const std::string& reason)
 {
-    std::string response = "ERR " + reason + "\n";
-    send_all(socket_fd, response.c_str(), response.size());
+    std::string response =
+        "ERR " + reason + "\n";
+
+    if (!send_all(
+            client_fd,
+            response.data(),
+            response.size())) {
+        std::cerr << "Failed to send error response"
+                  << std::endl;
+    }
 }
-
-
